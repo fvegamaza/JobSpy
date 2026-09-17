@@ -1,0 +1,17 @@
+services:
+  jobspy-mcp:
+    build: .
+    container_name: jobspy-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8000"
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 5).close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

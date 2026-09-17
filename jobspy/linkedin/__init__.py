@@ -224,6 +224,8 @@ class LinkedIn(Scraper):
         if full_descr:
             job_details = self._get_job_details(job_id)
             description = job_details.get("description")
+            # ponytail: sequential fetches; add proxies if 429s show up
+            time.sleep(random.uniform(1.0, 2.0))
         is_remote = is_job_remote(title, description, location)
 
         return JobPost(
@@ -237,7 +239,7 @@ class LinkedIn(Scraper):
             job_url=f"{self.base_url}/jobs/view/{job_id}",
             compensation=compensation,
             job_type=job_details.get("job_type"),
-            job_level=job_details.get("job_level", "").lower(),
+            job_level=(job_details.get("job_level") or "").lower(),
             company_industry=job_details.get("company_industry"),
             description=job_details.get("description"),
             job_url_direct=job_details.get("job_url_direct"),
@@ -246,23 +248,35 @@ class LinkedIn(Scraper):
             job_function=job_details.get("job_function"),
         )
 
+    def _fetch_job_page(self, job_id: str) -> Optional[BeautifulSoup]:
+        urls = (
+            f"{self.base_url}/jobs-guest/jobs/api/jobPosting/{job_id}",
+            f"{self.base_url}/jobs/view/{job_id}",
+        )
+        for url in urls:
+            try:
+                response = self.session.get(url, timeout=10)
+                response.raise_for_status()
+            except Exception as e:
+                log.warning(f"job {job_id} fetch failed ({url}): {e}")
+                continue
+            if "linkedin.com/signup" in response.url:
+                log.warning(f"job {job_id} redirected to signup")
+                continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            if soup.find("div", class_=lambda x: x and "show-more-less-html__markup" in x):
+                return soup
+            log.warning(f"job {job_id} missing description markup")
+        return None
+
     def _get_job_details(self, job_id: str) -> dict:
         """
-        Retrieves job description and other job details by going to the job page url
-        :param job_page_url:
-        :return: dict
+        Retrieves job description and other job details from the public guest page.
         """
-        try:
-            response = self.session.get(
-                f"{self.base_url}/jobs/view/{job_id}", timeout=5
-            )
-            response.raise_for_status()
-        except:
-            return {}
-        if "linkedin.com/signup" in response.url:
+        soup = self._fetch_job_page(job_id)
+        if soup is None:
             return {}
 
-        soup = BeautifulSoup(response.text, "html.parser")
         div_content = soup.find(
             "div", class_=lambda x: x and "show-more-less-html__markup" in x
         )
@@ -275,7 +289,7 @@ class LinkedIn(Scraper):
             elif self.scraper_input.description_format == DescriptionFormat.PLAIN:
                 description = plain_converter(description)
         h3_tag = soup.find(
-            "h3", text=lambda text: text and "Job function" in text.strip()
+            "h3", string=lambda text: text and "Job function" in text.strip()
         )
 
         job_function = None

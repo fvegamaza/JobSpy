@@ -182,6 +182,55 @@ Bayt only uses the search_term parameter currently and searches internationally
 
 ## Frequently Asked Questions
 
+## Use JobSpy as an MCP server with Hermes Agent
+
+This repository includes `jobspy_mcp_server.py`, which exposes a `search_jobs`
+tool over the MCP stdio transport. Add it to Hermes on Windows with:
+
+```powershell
+hermes mcp add jobspy --command "C:\ProgramData\miniconda3\envs\scraping\python.exe" --args "C:\Users\Franco\Desktop\Github\linkedin\JobSpy\jobspy_mcp_server.py"
+hermes mcp test jobspy
+```
+
+Alternatively, add the following under `mcp_servers` in
+`~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  jobspy:
+    command: "C:\\ProgramData\\miniconda3\\envs\\scraping\\python.exe"
+    args:
+      - "C:\\Users\\Franco\\Desktop\\Github\\linkedin\\JobSpy\\jobspy_mcp_server.py"
+    timeout: 180
+    connect_timeout: 60
+```
+
+After restarting Hermes (or running `/reload-mcp`), ask:
+
+> Search for data scientist jobs in Vienna, Austria posted in the last week.
+
+### Docker deployment on a remote host
+
+Start the Streamable HTTP server with:
+
+```bash
+docker compose up -d --build
+```
+
+The Compose configuration binds port 8000 only to the remote host's loopback
+interface. From the machine running Hermes, open an SSH tunnel:
+
+```powershell
+ssh -N -L 8765:127.0.0.1:8765 vm
+```
+
+Then register the tunneled endpoint:
+
+```powershell
+hermes mcp add jobspy --url http://127.0.0.1:8765/mcp
+hermes mcp test jobspy
+```
+
 ---
 **Q: Why is Indeed giving unrelated roles?**  
 **A:** Indeed searches the description too.
