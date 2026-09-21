@@ -6,6 +6,7 @@ import requests
 from typing import Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode
 
 from jobspy.glassdoor.constant import fallback_token, query_template, headers
 from jobspy.glassdoor.util import (
@@ -49,6 +50,7 @@ class Glassdoor(Scraper):
         self.jobs_per_page = 30
         self.max_pages = 30
         self.seen_urls = set()
+        self._headers = dict(headers)
 
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         """
@@ -58,16 +60,24 @@ class Glassdoor(Scraper):
         """
         self.scraper_input = scraper_input
         self.scraper_input.results_wanted = min(900, scraper_input.results_wanted)
-        self.base_url = self.scraper_input.country.get_glassdoor_url()
+        self.base_url = self.scraper_input.country.get_glassdoor_url().rstrip("/")
+        host = self.base_url.split("//", 1)[-1]
+        self._headers = dict(headers)
+        self._headers["origin"] = self.base_url
+        self._headers["referer"] = f"{self.base_url}/"
+        self._headers["authority"] = host
 
         self.session = create_session(
             proxies=self.proxies, ca_cert=self.ca_cert, has_retry=True
         )
-        token = self._get_csrf_token()
-        headers["gd-csrf-token"] = token if token else fallback_token
+        self._headers["gd-csrf-token"] = fallback_token
         if self.user_agent:
-            headers["user-agent"] = self.user_agent
-        self.session.headers.update(headers)
+            self._headers["user-agent"] = self.user_agent
+        self.session.headers.update(self._headers)
+        token = self._get_csrf_token()
+        if token:
+            self._headers["gd-csrf-token"] = token
+            self.session.headers.update({"gd-csrf-token": token})
 
         location_id, location_type = self._get_location(
             scraper_input.location, scraper_input.is_remote
@@ -120,7 +130,8 @@ class Glassdoor(Scraper):
                 exc_msg = f"bad response status code: {response.status_code}"
                 raise GlassdoorException(exc_msg)
             res_json = response.json()[0]
-            if "errors" in res_json:
+            jobs_root = (res_json.get("data") or {}).get("jobListings")
+            if jobs_root is None:
                 raise ValueError("Error encountered in API response")
         except (
             requests.exceptions.ReadTimeout,
@@ -131,7 +142,7 @@ class Glassdoor(Scraper):
             log.error(f"Glassdoor: {str(e)}")
             return jobs, None
 
-        jobs_data = res_json["data"]["jobListings"]["jobListings"]
+        jobs_data = jobs_root.get("jobListings") or []
 
         with ThreadPoolExecutor(max_workers=self.jobs_per_page) as executor:
             future_to_job_data = {
@@ -146,27 +157,25 @@ class Glassdoor(Scraper):
                     raise GlassdoorException(f"Glassdoor generated an exception: {exc}")
 
         return jobs, get_cursor_for_page(
-            res_json["data"]["jobListings"]["paginationCursors"], page_num + 1
+            jobs_root.get("paginationCursors") or [], page_num + 1
         )
 
     def _get_csrf_token(self):
-        """
-        Fetches csrf token needed for API by visiting a generic page
-        """
-        res = self.session.get(f"{self.base_url}/Job/computer-science-jobs.htm")
-        pattern = r'"token":\s*"([^"]+)"'
-        matches = re.findall(pattern, res.text)
-        token = None
-        if matches:
-            token = matches[0]
-        return token
+        """Homepage, following redirects. /Job/computer-science-jobs.htm 404s now."""
+        res = self.session.get(f"{self.base_url}/", allow_redirects=True)
+        matches = [
+            t
+            for t in re.findall(r'"token":\s*"([^"]+)"', res.text or "")
+            if len(t) > 8
+        ]
+        return matches[0] if matches else None
 
     def _process_job(self, job_data):
         """
         Processes a single job and fetches its description.
         """
         job_id = job_data["jobview"]["job"]["listingId"]
-        job_url = f"{self.base_url}job-listing/j?jl={job_id}"
+        job_url = f"{self.base_url}/job-listing/j?jl={job_id}"
         if job_url in self.seen_urls:
             return None
         self.seen_urls.add(job_url)
@@ -191,7 +200,7 @@ class Glassdoor(Scraper):
             description = self._fetch_job_description(job_id)
         except:
             description = None
-        company_url = f"{self.base_url}Overview/W-EI_IE{company_id}.htm"
+        company_url = f"{self.base_url}/Overview/W-EI_IE{company_id}.htm"
         company_logo = (
             job_data["jobview"].get("overview", {}).get("squareLogoUrl", None)
         )
@@ -246,7 +255,7 @@ class Glassdoor(Scraper):
                 """,
             }
         ]
-        res = requests.post(url, json=body, headers=headers)
+        res = requests.post(url, json=body, headers=self._headers)
         if res.status_code != 200:
             return None
         data = res.json()[0]
@@ -258,29 +267,23 @@ class Glassdoor(Scraper):
     def _get_location(self, location: str, is_remote: bool) -> (int, str):
         if not location or is_remote:
             return "11047", "STATE"  # remote options
-        url = f"{self.base_url}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
+        query = urlencode({"term": location})
+        for loc_filter in ("COUNTRY", "CITY", "STATE"):
+            query += f"&locationTypeFilters={loc_filter}"
+        url = f"{self.base_url}/autocomplete/location?{query}"
         res = self.session.get(url)
         if res.status_code != 200:
             if res.status_code == 429:
-                err = f"429 Response - Blocked by Glassdoor for too many requests"
-                log.error(err)
-                return None, None
+                log.error("429 Response - Blocked by Glassdoor for too many requests")
             else:
-                err = f"Glassdoor response status code {res.status_code}"
-                err += f" - {res.text}"
                 log.error(f"Glassdoor response status code {res.status_code}")
-                return None, None
+            return None, None
         items = res.json()
 
         if not items:
             raise ValueError(f"Location '{location}' not found on Glassdoor")
-        location_type = items[0]["locationType"]
-        if location_type == "C":
-            location_type = "CITY"
-        elif location_type == "S":
-            location_type = "STATE"
-        elif location_type == "N":
-            location_type = "COUNTRY"
+        type_map = {"C": "CITY", "S": "STATE", "N": "COUNTRY"}
+        location_type = type_map.get(items[0]["locationType"], items[0]["locationType"])
         return int(items[0]["locationId"]), location_type
 
     def _add_payload(
